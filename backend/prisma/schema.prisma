@@ -1,0 +1,179 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id @default(cuid())
+  username     String   @unique
+  passwordHash String
+  role         String   @default("admin")
+  locale       String   @default("ru")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model Account {
+  id              String   @id @default(cuid())
+  login           String   @unique
+  displayName     String?
+  twitchUserId    String?
+  has2FA          Boolean  @default(false)
+  authTokenEnc    String?
+  passwordEnc     String?
+  status          String   @default("idle") // idle | running | error | stopped
+  lastError       String?
+  lastSeenAt      DateTime?
+  enabled         Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  groups          GroupOnAccount[]
+  accountStreamers AccountStreamer[]
+  pointsSnapshots PointsSnapshot[]
+  pointsEvents    PointsEvent[]
+  watchSessions   WatchSession[]
+  actionLogs      ActionLog[]
+  automation      AutomationSetting[]
+
+  @@index([status])
+  @@index([enabled])
+}
+
+model Group {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  color       String?
+  createdAt   DateTime @default(now())
+  accounts    GroupOnAccount[]
+}
+
+model GroupOnAccount {
+  groupId   String
+  accountId String
+  group     Group   @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  account   Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  @@id([groupId, accountId])
+}
+
+model Streamer {
+  id            String   @id @default(cuid())
+  login         String   @unique
+  displayName   String?
+  twitchId      String?  @unique
+  isOnline      Boolean  @default(false)
+  streamTitle   String?
+  streamGame    String?
+  viewersCount  Int?
+  lastCheckedAt DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  accountStreamers AccountStreamer[]
+  pointsSnapshots  PointsSnapshot[]
+  pointsEvents     PointsEvent[]
+  watchSessions    WatchSession[]
+  automation       AutomationSetting[]
+
+  @@index([isOnline])
+}
+
+model AccountStreamer {
+  id         String   @id @default(cuid())
+  accountId  String
+  streamerId String
+  priority   Int      @default(0)
+  createdAt  DateTime @default(now())
+
+  account  Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  streamer Streamer @relation(fields: [streamerId], references: [id], onDelete: Cascade)
+
+  @@unique([accountId, streamerId])
+}
+
+model PointsSnapshot {
+  id         String   @id @default(cuid())
+  accountId  String
+  streamerId String
+  points     Int
+  capturedAt DateTime @default(now())
+
+  account  Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  streamer Streamer @relation(fields: [streamerId], references: [id], onDelete: Cascade)
+
+  @@index([accountId, streamerId, capturedAt])
+  @@index([capturedAt])
+}
+
+model PointsEvent {
+  id          String   @id @default(cuid())
+  accountId   String
+  streamerId  String
+  type        String   // WATCH | CLAIM | RAID | PREDICTION | WATCH_STREAK | DROPS | OTHER
+  reasonCode  String?
+  amount      Int
+  balance     Int?
+  occurredAt  DateTime @default(now())
+
+  account  Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  streamer Streamer @relation(fields: [streamerId], references: [id], onDelete: Cascade)
+
+  @@index([accountId, occurredAt])
+  @@index([streamerId, occurredAt])
+  @@index([type, occurredAt])
+}
+
+model WatchSession {
+  id         String   @id @default(cuid())
+  accountId  String
+  streamerId String
+  startedAt  DateTime @default(now())
+  endedAt    DateTime?
+  minutes    Int      @default(0)
+
+  account  Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  streamer Streamer @relation(fields: [streamerId], references: [id], onDelete: Cascade)
+
+  @@index([accountId, startedAt])
+}
+
+model ActionLog {
+  id        String   @id @default(cuid())
+  accountId String?
+  level     String   @default("info") // debug | info | warn | error
+  category  String   // auth | miner | points | prediction | automation | api
+  message   String
+  meta      Json?
+  createdAt DateTime @default(now())
+
+  account Account? @relation(fields: [accountId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+  @@index([level])
+  @@index([category, createdAt])
+  @@index([accountId, createdAt])
+}
+
+model AutomationSetting {
+  id              String   @id @default(cuid())
+  accountId       String
+  streamerId      String?  // null = global for account
+  makePredictions Boolean  @default(false)
+  claimDrops      Boolean  @default(true)
+  claimMoments    Boolean  @default(true)
+  followRaid      Boolean  @default(true)
+  watchStreak     Boolean  @default(true)
+  betPercentage   Int      @default(5)
+  betMaxPoints    Int      @default(50000)
+  betMinPoints    Int      @default(20000)
+  updatedAt       DateTime @updatedAt
+
+  account  Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  streamer Streamer? @relation(fields: [streamerId], references: [id], onDelete: Cascade)
+
+  @@unique([accountId, streamerId])
+}
