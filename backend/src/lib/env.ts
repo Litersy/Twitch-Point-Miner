@@ -10,7 +10,7 @@ const schema = z.object({
   DATABASE_URL: z.string().url(),
   REDIS_URL: z.string().url(),
   ADMIN_USERNAME: z.string().default('admin'),
-  ADMIN_PASSWORD: z.string().min(8).default('changemeplease'),
+  ADMIN_PASSWORD: z.string().min(4).default('changemeplease'),
 });
 
 export const env = schema.parse(process.env);
