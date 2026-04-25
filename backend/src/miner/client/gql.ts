@@ -1,6 +1,14 @@
 import { request } from 'undici';
-import { CLIENT_ID, CLIENT_VERSION, GQL, GQL_URL, USER_AGENT, type GqlOpName } from '../constants.js';
+import { CLIENT_ID, CLIENT_VERSION, GQL, GQL_URL, type GqlOpName } from '../constants.js';
 import { randomBytes } from 'node:crypto';
+import {
+  browserHeaders,
+  pickUserAgent,
+  preRequestJitter,
+  retryDelayForResponse,
+  sleep,
+} from '../humanize.js';
+import { logger } from '../../lib/logger.js';
 
 function buildOp(name: GqlOpName, variables: Record<string, unknown>) {
   return {
@@ -19,13 +27,17 @@ export type StreamInfo = {
   viewers?: number;
 };
 
+const MAX_ATTEMPTS = 5;
+
 export class TwitchGQL {
   readonly deviceId: string;
+  readonly userAgent: string;
   private readonly sessionId: string;
 
-  constructor(private readonly authToken: string) {
+  constructor(private readonly authToken: string, userAgent?: string) {
     this.deviceId = randomBytes(16).toString('hex');
     this.sessionId = randomBytes(16).toString('hex');
+    this.userAgent = userAgent ?? pickUserAgent();
   }
 
   getAuthToken(): string {
@@ -33,26 +45,41 @@ export class TwitchGQL {
   }
 
   private async post<T = unknown>(body: unknown): Promise<T> {
-    const res = await request(GQL_URL, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        authorization: `OAuth ${this.authToken}`,
-        'client-id': CLIENT_ID,
-        'client-session-id': this.sessionId,
-        'client-version': CLIENT_VERSION,
-        'user-agent': USER_AGENT,
-        'x-device-id': this.deviceId,
-      },
-      body: JSON.stringify(body),
-      bodyTimeout: 20_000,
-      headersTimeout: 20_000,
-    });
-    if (res.statusCode >= 400) {
-      const text = await res.body.text();
-      throw new Error(`GQL HTTP ${res.statusCode}: ${text.slice(0, 500)}`);
+    await preRequestJitter();
+
+    let attempt = 0;
+    while (true) {
+      const res = await request(GQL_URL, {
+        method: 'POST',
+        headers: browserHeaders({
+          'content-type': 'application/json',
+          'authorization': `OAuth ${this.authToken}`,
+          'client-id': CLIENT_ID,
+          'client-session-id': this.sessionId,
+          'client-version': CLIENT_VERSION,
+          'user-agent': this.userAgent,
+          'x-device-id': this.deviceId,
+        }),
+        body: JSON.stringify(body),
+        bodyTimeout: 20_000,
+        headersTimeout: 20_000,
+      });
+
+      const delay = retryDelayForResponse(res, attempt);
+      if (delay !== null && attempt < MAX_ATTEMPTS - 1) {
+        attempt++;
+        logger.warn({ status: res.statusCode, attempt, delay }, 'GQL retrying');
+        await res.body.dump();
+        await sleep(delay);
+        continue;
+      }
+
+      if (res.statusCode >= 400) {
+        const text = await res.body.text();
+        throw new Error(`GQL HTTP ${res.statusCode}: ${text.slice(0, 500)}`);
+      }
+      return (await res.body.json()) as T;
     }
-    return (await res.body.json()) as T;
   }
 
   async getChannelIdByLogin(login: string): Promise<string | null> {

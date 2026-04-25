@@ -1,5 +1,7 @@
 import { request } from 'undici';
-import { USER_AGENT, TWITCH_URL } from '../constants.js';
+import { TWITCH_URL } from '../constants.js';
+import { browserHeaders, pickUserAgent, preRequestJitter, retryDelayForResponse, sleep } from '../humanize.js';
+import { logger } from '../../lib/logger.js';
 
 /**
  * Minute-watched pipeline — direct port of
@@ -17,27 +19,67 @@ import { USER_AGENT, TWITCH_URL } from '../constants.js';
 
 const SETTINGS_RE = /(https:\/\/static\.twitchcdn\.net\/config\/settings.*?js|https:\/\/assets\.twitch\.tv\/config\/settings.*?\.js)/;
 const SPADE_RE = /"spade_url":"(.*?)"/;
+const MAX_ATTEMPTS = 4;
 
-export async function fetchSpadeUrl(login: string): Promise<string | null> {
-  try {
-    const page = await request(`${TWITCH_URL}/${login}`, {
-      method: 'GET',
-      headers: { 'user-agent': USER_AGENT },
+type Method = 'GET' | 'HEAD' | 'POST';
+
+async function httpWithRetry(
+  url: string,
+  init: { method: Method; headers: Record<string, string>; body?: string },
+): Promise<{ statusCode: number; headers: Record<string, string | string[] | undefined>; bodyText(): Promise<string>; dump(): Promise<void> }> {
+  await preRequestJitter();
+  let attempt = 0;
+  while (true) {
+    const res = await request(url, {
+      method: init.method,
+      headers: init.headers,
+      body: init.body,
       bodyTimeout: 20_000,
       headersTimeout: 20_000,
     });
-    const html = await page.body.text();
+
+    const delay = retryDelayForResponse(res, attempt);
+    if (delay !== null && attempt < MAX_ATTEMPTS - 1) {
+      attempt++;
+      logger.warn({ status: res.statusCode, attempt, delay, url }, 'spade retrying');
+      await res.body.dump();
+      await sleep(delay);
+      continue;
+    }
+
+    return {
+      statusCode: res.statusCode,
+      headers: res.headers,
+      bodyText: () => res.body.text(),
+      dump: () => res.body.dump(),
+    };
+  }
+}
+
+export async function fetchSpadeUrl(login: string, userAgent: string = pickUserAgent()): Promise<string | null> {
+  try {
+    const page = await httpWithRetry(`${TWITCH_URL}/${login}`, {
+      method: 'GET',
+      headers: browserHeaders({ 'user-agent': userAgent }),
+    });
+    if (page.statusCode >= 400) {
+      await page.dump();
+      return null;
+    }
+    const html = await page.bodyText();
     const settingsMatch = html.match(SETTINGS_RE);
     if (!settingsMatch) return null;
     const settingsUrl = settingsMatch[1];
 
-    const settings = await request(settingsUrl, {
+    const settings = await httpWithRetry(settingsUrl, {
       method: 'GET',
-      headers: { 'user-agent': USER_AGENT },
-      bodyTimeout: 20_000,
-      headersTimeout: 20_000,
+      headers: browserHeaders({ 'user-agent': userAgent }),
     });
-    const js = await settings.body.text();
+    if (settings.statusCode >= 400) {
+      await settings.dump();
+      return null;
+    }
+    const js = await settings.bodyText();
     const spade = js.match(SPADE_RE);
     return spade?.[1] ?? null;
   } catch {
@@ -79,43 +121,44 @@ function encodeMinuteWatchedBody(props: MinuteWatchedProps): string {
 export async function simulatePlayerOpen(
   login: string,
   playback: { signature: string; value: string },
+  userAgent: string = pickUserAgent(),
 ): Promise<boolean> {
   try {
     const hlsUrl = `https://usher.ttvnw.net/api/channel/hls/${login}.m3u8?sig=${playback.signature}&token=${encodeURIComponent(
       playback.value,
     )}`;
-    const hls = await request(hlsUrl, {
+    const hls = await httpWithRetry(hlsUrl, {
       method: 'GET',
-      headers: { 'user-agent': USER_AGENT },
-      bodyTimeout: 20_000,
-      headersTimeout: 20_000,
+      headers: browserHeaders({ 'user-agent': userAgent }),
     });
-    if (hls.statusCode !== 200) return false;
-    const text = await hls.body.text();
+    if (hls.statusCode !== 200) {
+      await hls.dump();
+      return false;
+    }
+    const text = await hls.bodyText();
     const lines = text.split('\n').filter(Boolean);
     const lastUrl = lines[lines.length - 1];
     if (!lastUrl?.startsWith('http')) return false;
 
     // Fetch the lowest-quality sub-playlist, then HEAD the segment URL it contains.
-    const sub = await request(lastUrl, {
+    const sub = await httpWithRetry(lastUrl, {
       method: 'GET',
-      headers: { 'user-agent': USER_AGENT },
-      bodyTimeout: 20_000,
-      headersTimeout: 20_000,
+      headers: browserHeaders({ 'user-agent': userAgent }),
     });
-    if (sub.statusCode !== 200) return false;
-    const subText = await sub.body.text();
+    if (sub.statusCode !== 200) {
+      await sub.dump();
+      return false;
+    }
+    const subText = await sub.bodyText();
     const subLines = subText.split('\n').filter(Boolean);
     const segment = subLines[subLines.length - 1];
     if (!segment?.startsWith('http')) return false;
 
-    const head = await request(segment, {
+    const head = await httpWithRetry(segment, {
       method: 'HEAD',
-      headers: { 'user-agent': USER_AGENT },
-      bodyTimeout: 20_000,
-      headersTimeout: 20_000,
+      headers: browserHeaders({ 'user-agent': userAgent }),
     });
-    await head.body.dump();
+    await head.dump();
     return head.statusCode < 400;
   } catch {
     return false;
@@ -126,20 +169,22 @@ export async function simulatePlayerOpen(
  * Send one minute-watched hit to the spade URL. Returns true on 204 No Content —
  * which is Twitch's success indicator for this event.
  */
-export async function sendMinuteWatched(spadeUrl: string, props: MinuteWatchedProps): Promise<boolean> {
+export async function sendMinuteWatched(
+  spadeUrl: string,
+  props: MinuteWatchedProps,
+  userAgent: string = pickUserAgent(),
+): Promise<boolean> {
   try {
     const body = encodeMinuteWatchedBody(props);
-    const res = await request(spadeUrl, {
+    const res = await httpWithRetry(spadeUrl, {
       method: 'POST',
-      headers: {
-        'user-agent': USER_AGENT,
+      headers: browserHeaders({
+        'user-agent': userAgent,
         'content-type': 'application/x-www-form-urlencoded',
-      },
+      }),
       body,
-      bodyTimeout: 20_000,
-      headersTimeout: 20_000,
     });
-    await res.body.dump();
+    await res.dump();
     return res.statusCode === 204;
   } catch {
     return false;

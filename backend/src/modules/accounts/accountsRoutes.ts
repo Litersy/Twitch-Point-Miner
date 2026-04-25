@@ -28,7 +28,16 @@ const updateSchema = z.object({
   has2FA: z.boolean().optional(),
   enabled: z.boolean().optional(),
   groupIds: z.array(z.string()).optional(),
-});
+  sleepEnabled: z.boolean().optional(),
+  timezone: z.string().min(1).max(64).optional(),
+  activeStartMin: z.number().int().min(0).max(1439).optional(),
+  activeEndMin: z.number().int().min(0).max(1439).optional(),
+  jitterFromMin: z.number().int().min(0).max(180).optional(),
+  jitterToMin: z.number().int().min(0).max(180).optional(),
+}).refine(
+  (d) => d.jitterFromMin === undefined || d.jitterToMin === undefined || d.jitterFromMin <= d.jitterToMin,
+  { message: 'jitterFromMin must be <= jitterToMin' },
+);
 
 export const accountsRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.addHook('preHandler', fastify.authRequired);
@@ -54,6 +63,12 @@ export const accountsRoutes: FastifyPluginAsync = async (fastify) => {
       hasAuthToken: !!a.authTokenEnc,
       streamerCount: a._count.accountStreamers,
       groups: a.groups.map((g) => ({ id: g.group.id, name: g.group.name, color: g.group.color })),
+      sleepEnabled: a.sleepEnabled,
+      timezone: a.timezone,
+      activeStartMin: a.activeStartMin,
+      activeEndMin: a.activeEndMin,
+      jitterFromMin: a.jitterFromMin,
+      jitterToMin: a.jitterToMin,
       createdAt: a.createdAt,
     }));
   });
@@ -122,6 +137,12 @@ export const accountsRoutes: FastifyPluginAsync = async (fastify) => {
     if (d.has2FA !== undefined) data.has2FA = d.has2FA;
     if (d.enabled !== undefined) data.enabled = d.enabled;
     if (d.authToken !== undefined) data.authTokenEnc = encryptSecret(d.authToken);
+    if (d.sleepEnabled !== undefined) data.sleepEnabled = d.sleepEnabled;
+    if (d.timezone !== undefined) data.timezone = d.timezone;
+    if (d.activeStartMin !== undefined) data.activeStartMin = d.activeStartMin;
+    if (d.activeEndMin !== undefined) data.activeEndMin = d.activeEndMin;
+    if (d.jitterFromMin !== undefined) data.jitterFromMin = d.jitterFromMin;
+    if (d.jitterToMin !== undefined) data.jitterToMin = d.jitterToMin;
 
     await prisma.account.update({ where: { id }, data });
 

@@ -1,9 +1,11 @@
 import { prisma } from '../lib/prisma.js';
 import { decryptSecret } from '../lib/crypto.js';
 import { logger } from '../lib/logger.js';
+import { isAccountSleeping } from '../lib/sleepWindow.js';
 import { TwitchGQL, type StreamInfo } from './client/gql.js';
 import { PubSubConnection } from './pubsub/PubSubConnection.js';
 import { fetchSpadeUrl, sendMinuteWatched, simulatePlayerOpen } from './client/spade.js';
+import { chance, microJitter, pickUserAgent, rand, sleep } from './humanize.js';
 
 type StreamerRow = { id: string; login: string; twitchId: string };
 
@@ -16,12 +18,35 @@ type WatchState = {
 };
 
 const MAX_WATCH = 2; // Twitch limit: you can only accrue watch progress on 2 channels simultaneously.
-const WATCH_TICK_MS = 60_000; // once per minute, as in the Python miner.
+
+// Watch tick: roughly once a minute (matches Python miner's 60s pacing) but
+// with ±15s jitter so two accounts on the same panel never fire on the same tick.
+const WATCH_TICK_MIN_MS = 55_000;
+const WATCH_TICK_MAX_MS = 80_000;
+
+// Stream-info polling cadence. Online streamers get refreshed roughly every minute
+// (PubSub also pushes viewcount, so this is mostly belt-and-suspenders).
+const POLL_TICK_MIN_MS = 75_000;
+const POLL_TICK_MAX_MS = 110_000;
+
+// Cooldown for re-checking a streamer that's currently offline. PubSub pushes
+// stream-up events anyway, so polling offline channels every minute is wasted
+// (and noisy) traffic — exactly what anti-abuse heuristics watch for.
+const OFFLINE_RECHECK_MS = 5 * 60_000;
+
+// Probability of skipping a single "stream info" poll for a given streamer on
+// a given tick. Real users do not refresh every channel every minute — this
+// breaks up the perfectly-uniform polling pattern.
+const POLL_SKIP_CHANCE = 0.15;
 
 /**
  * A single Twitch account "session": holds the PubSub connection, polls online status
  * for attached streamers, keeps points snapshot up to date, persists events, and
  * performs the minute-watched pipeline so points actually accrue.
+ *
+ * All outbound traffic is randomised — request order, headers (per-session UA),
+ * inter-request jitter, retry on 429/5xx — so the account looks like a real
+ * browser tab rather than a polling bot.
  */
 export class MinerSession {
   private pubsub?: PubSubConnection;
@@ -31,6 +56,8 @@ export class MinerSession {
   private pollTimer?: NodeJS.Timeout;
   private watchTimer?: NodeJS.Timeout;
   private activeWatch = new Map<string, WatchState>();
+  private stopping = false;
+  private readonly userAgent = pickUserAgent();
 
   constructor(public readonly accountId: string) {}
 
@@ -44,7 +71,7 @@ export class MinerSession {
 
     const token = decryptSecret(account.authTokenEnc);
     if (!token) throw new Error('no auth token configured — re-link the account via Twitch device flow');
-    this.gql = new TwitchGQL(token);
+    this.gql = new TwitchGQL(token, this.userAgent);
 
     let twitchUserId = account.twitchUserId;
     if (!twitchUserId) {
@@ -64,6 +91,9 @@ export class MinerSession {
 
     this.streamers = [];
     for (const as of account.accountStreamers) {
+      // Match the upstream miner: small randomised pauses between streamer init
+      // calls so the GQL traffic doesn't burst all at once.
+      await microJitter();
       let twitchId = as.streamer.twitchId;
       if (!twitchId) {
         twitchId = await this.gql.getChannelIdByLogin(as.streamer.login);
@@ -84,17 +114,17 @@ export class MinerSession {
     }
 
     await this.refreshPoints();
-
-    this.pollTimer = setInterval(() => this.pollStreams().catch((e) => logger.warn({ e }, 'poll error')), 60_000);
     await this.pollStreams();
 
-    this.watchTimer = setInterval(() => this.tickWatch().catch((e) => logger.warn({ e }, 'watch tick error')), WATCH_TICK_MS);
+    this.scheduleNextPoll();
+    this.scheduleNextWatch();
   }
 
   async stop(): Promise<void> {
+    this.stopping = true;
     this.pubsub?.close();
-    if (this.pollTimer) clearInterval(this.pollTimer);
-    if (this.watchTimer) clearInterval(this.watchTimer);
+    if (this.pollTimer) clearTimeout(this.pollTimer);
+    if (this.watchTimer) clearTimeout(this.watchTimer);
     for (const [, info] of this.activeWatch) {
       await prisma.watchSession.update({ where: { id: info.sessionId }, data: { endedAt: new Date() } }).catch(() => {});
     }
@@ -119,6 +149,60 @@ export class MinerSession {
     this.pubsub.listen(`video-playback-by-id.${twitchId}`);
     this.pubsub.listen(`raid.${twitchId}`);
     this.pubsub.listen(`predictions-channel-v1.${twitchId}`);
+  }
+
+  /**
+   * Read current sleep config from DB and check whether the account should be
+   * "asleep" right now. Hot-read so changes from the UI take effect on the
+   * next tick without requiring a session restart.
+   */
+  private async isSleeping(): Promise<boolean> {
+    const acc = await prisma.account.findUnique({
+      where: { id: this.accountId },
+      select: {
+        id: true,
+        sleepEnabled: true,
+        timezone: true,
+        activeStartMin: true,
+        activeEndMin: true,
+        jitterFromMin: true,
+        jitterToMin: true,
+      },
+    });
+    if (!acc) return false;
+    return isAccountSleeping(acc);
+  }
+
+  /** Close every active watch session — used when the account goes to sleep. */
+  private async closeAllActiveWatches(reason: string): Promise<void> {
+    if (this.activeWatch.size === 0) return;
+    for (const [streamerId, state] of [...this.activeWatch.entries()]) {
+      await prisma.watchSession.update({ where: { id: state.sessionId }, data: { endedAt: new Date() } }).catch(() => {});
+      this.activeWatch.delete(streamerId);
+    }
+    await this.writeLog('info', 'miner', `closed all watch sessions (${reason})`);
+  }
+
+  private scheduleNextPoll(): void {
+    if (this.stopping) return;
+    this.pollTimer = setTimeout(
+      () =>
+        this.pollStreams()
+          .catch((e) => logger.warn({ e }, 'poll error'))
+          .finally(() => this.scheduleNextPoll()),
+      rand(POLL_TICK_MIN_MS, POLL_TICK_MAX_MS),
+    );
+  }
+
+  private scheduleNextWatch(): void {
+    if (this.stopping) return;
+    this.watchTimer = setTimeout(
+      () =>
+        this.tickWatch()
+          .catch((e) => logger.warn({ e }, 'watch tick error'))
+          .finally(() => this.scheduleNextWatch()),
+      rand(WATCH_TICK_MIN_MS, WATCH_TICK_MAX_MS),
+    );
   }
 
   private async onPubSub(topic: string, payload: any): Promise<void> {
@@ -164,6 +248,10 @@ export class MinerSession {
       const claimId: string = payload.data?.claim?.id;
       const streamer = this.streamers.find((s) => s.twitchId === channelId);
       if (!streamer || !this.gql) return;
+      // Sleeping humans don't click the chest in the moment it appears.
+      if (await this.isSleeping()) return;
+      // Real users don't claim within a millisecond of the bonus appearing.
+      await sleep(rand(800, 3500));
       const ok = await this.gql.claimCommunityPoints(channelId, claimId);
       await this.writeLog('info', 'points', `bonus ${ok ? 'claimed' : 'claim failed'} on ${streamer.login}`);
     }
@@ -191,7 +279,34 @@ export class MinerSession {
 
   private async pollStreams(): Promise<void> {
     if (!this.gql) return;
-    for (const s of this.streamers) {
+
+    // Sleep window: a real human isn't refreshing channel pages at 4am.
+    if (await this.isSleeping()) return;
+
+    // Fetch current state from the DB so we know which streamers are offline
+    // (and how recently we last checked them).
+    const rows = await prisma.streamer.findMany({
+      where: { id: { in: this.streamers.map((s) => s.id) } },
+      select: { id: true, login: true, isOnline: true, lastCheckedAt: true },
+    });
+    const stateById = new Map(rows.map((r) => [r.id, r]));
+
+    // Shuffle so the per-tick order isn't deterministic — anti-abuse systems
+    // often look for "always polls X then Y then Z" patterns.
+    const order = [...this.streamers].sort(() => Math.random() - 0.5);
+
+    const now = Date.now();
+    for (const s of order) {
+      const state = stateById.get(s.id);
+      const lastCheckedMs = state?.lastCheckedAt ? state.lastCheckedAt.getTime() : 0;
+      const sinceCheck = now - lastCheckedMs;
+
+      // Offline streamers: only re-check periodically (PubSub pushes stream-up).
+      if (state && state.isOnline === false && sinceCheck < OFFLINE_RECHECK_MS) continue;
+
+      // Real users don't refresh every channel on every tick.
+      if (state?.isOnline && chance(POLL_SKIP_CHANCE)) continue;
+
       try {
         const info = await this.gql.getStreamInfo(s.login);
         await prisma.streamer.update({
@@ -207,6 +322,9 @@ export class MinerSession {
       } catch (err: any) {
         logger.debug({ err: err.message, login: s.login }, 'stream info failed');
       }
+
+      // Spread requests out so we don't burst the GQL endpoint.
+      await microJitter();
     }
     await prisma.account.update({ where: { id: this.accountId }, data: { lastSeenAt: new Date() } });
   }
@@ -217,6 +335,12 @@ export class MinerSession {
    */
   private async tickWatch(): Promise<void> {
     if (!this.gql) return;
+
+    // Sleep window: stop watching, close active sessions, and skip until awake.
+    if (await this.isSleeping()) {
+      await this.closeAllActiveWatches('account asleep');
+      return;
+    }
 
     // Snapshot of online, attached streamers, with current viewer count.
     const online = await prisma.streamer.findMany({
@@ -246,7 +370,7 @@ export class MinerSession {
       try {
         const info = await this.gql.getStreamInfo(s.login);
         if (!info.isLive || !info.broadcastId) continue;
-        const spadeUrl = await fetchSpadeUrl(s.login);
+        const spadeUrl = await fetchSpadeUrl(s.login, this.userAgent);
         const session = await prisma.watchSession.create({
           data: { accountId: this.accountId, streamerId: s.id, minutes: 0 },
         });
@@ -261,29 +385,36 @@ export class MinerSession {
       } catch (err: any) {
         logger.debug({ err: err?.message, login: s.login }, 'failed to open watch session');
       }
+      // Don't open all watch sessions in the same instant.
+      await microJitter();
     }
 
-    // For each active watch — send one minute-watched hit.
+    // For each active watch — send one minute-watched hit, with jitter between hits
+    // so two parallel watches don't fire on the same millisecond.
     for (const s of toWatch) {
       const state = this.activeWatch.get(s.id);
       if (!state) continue;
       try {
         if (!state.spadeUrl) {
-          state.spadeUrl = await fetchSpadeUrl(s.login);
+          state.spadeUrl = await fetchSpadeUrl(s.login, this.userAgent);
           if (!state.spadeUrl) continue;
         }
         const playback = await this.gql.getPlaybackAccessToken(s.login);
-        if (playback) await simulatePlayerOpen(s.login, playback);
+        if (playback) await simulatePlayerOpen(s.login, playback, this.userAgent);
 
         if (!state.info.broadcastId || !s.twitchId) continue;
-        const ok = await sendMinuteWatched(state.spadeUrl, {
-          channelId: s.twitchId,
-          broadcastId: state.info.broadcastId,
-          userId: this.twitchUserId,
-          channel: s.login,
-          game: state.info.game ?? null,
-          gameId: state.info.gameId ?? null,
-        });
+        const ok = await sendMinuteWatched(
+          state.spadeUrl,
+          {
+            channelId: s.twitchId,
+            broadcastId: state.info.broadcastId,
+            userId: this.twitchUserId,
+            channel: s.login,
+            game: state.info.game ?? null,
+            gameId: state.info.gameId ?? null,
+          },
+          this.userAgent,
+        );
         if (ok) {
           await prisma.watchSession.update({
             where: { id: state.sessionId },
@@ -294,11 +425,14 @@ export class MinerSession {
       } catch (err: any) {
         logger.debug({ err: err?.message, login: s.login }, 'minute-watched error');
       }
+      // Spread the two minute-watched hits across the tick so they don't co-fire.
+      await sleep(rand(1500, 5000));
     }
   }
 
   private async refreshPoints(): Promise<void> {
     if (!this.gql) return;
+    const sleeping = await this.isSleeping();
     for (const s of this.streamers) {
       try {
         const ctx = await this.gql.getChannelPointsContext(s.login);
@@ -306,13 +440,16 @@ export class MinerSession {
         await prisma.pointsSnapshot.create({
           data: { accountId: this.accountId, streamerId: s.id, points: ctx.balance },
         });
-        if (ctx.availableClaimId) {
+        if (ctx.availableClaimId && !sleeping) {
+          // Stagger initial bonus claims with a small human-like delay.
+          await sleep(rand(500, 2500));
           const ok = await this.gql.claimCommunityPoints(ctx.channelId, ctx.availableClaimId);
           await this.writeLog('info', 'points', `initial bonus ${ok ? 'claimed' : 'failed'} on ${s.login}`);
         }
       } catch (err: any) {
         logger.debug({ err: err.message, login: s.login }, 'points ctx failed');
       }
+      await microJitter();
     }
   }
 

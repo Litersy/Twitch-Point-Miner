@@ -29,6 +29,20 @@ model Account {
   lastError       String?
   lastSeenAt      DateTime?
   enabled         Boolean  @default(true)
+
+  // "Sleep window" — outside this window the miner stops sending minute-watched
+  // and claim requests for this account, so it looks like a real human who
+  // doesn't sit on Twitch 24/7.
+  sleepEnabled    Boolean  @default(false)
+  timezone        String   @default("Europe/Moscow") // IANA tz, e.g. "Europe/Moscow"
+  activeStartMin  Int      @default(540)   // minutes from local midnight, default 09:00
+  activeEndMin    Int      @default(1380)  // minutes from local midnight, default 23:00
+  // Daily randomised jitter applied to start and end independently, with a random
+  // sign (+/-). Magnitude is drawn from [jitterFromMin .. jitterToMin] each day,
+  // deterministically from (accountId, date) so it stays stable within a day.
+  jitterFromMin   Int      @default(1)
+  jitterToMin     Int      @default(30)
+
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 

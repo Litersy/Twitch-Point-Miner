@@ -106,22 +106,32 @@ export class PubSubConnection {
 
   private startPing() {
     this.stopPing();
-    this.pingTimer = setInterval(() => {
-      if (this.ws?.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify({ type: 'PING' }));
-      }
-    }, 4 * 60 * 1000); // every 4 minutes (twitch requires <5)
+    // Twitch requires a PING within 5 minutes; the official web client sends one
+    // roughly every 4 minutes with jitter. We do the same so every account on
+    // the same panel doesn't ping in lockstep.
+    const schedule = () => {
+      const delay = 3 * 60_000 + Math.floor(Math.random() * 90_000); // 3:00 – 4:30
+      this.pingTimer = setTimeout(() => {
+        if (this.ws?.readyState === WebSocket.OPEN) {
+          this.ws.send(JSON.stringify({ type: 'PING' }));
+        }
+        schedule();
+      }, delay);
+    };
+    schedule();
   }
 
   private stopPing() {
-    if (this.pingTimer) clearInterval(this.pingTimer);
+    if (this.pingTimer) clearTimeout(this.pingTimer);
     this.pingTimer = undefined;
   }
 
   private reconnect(reason: string) {
     this.stopPing();
     this.reconnectAttempts++;
-    const delay = Math.min(60_000, 2_000 * Math.pow(2, this.reconnectAttempts));
+    // Exponential backoff with jitter — never a perfectly-predictable retry.
+    const exp = Math.min(60_000, 2_000 * Math.pow(2, this.reconnectAttempts));
+    const delay = exp + Math.floor(Math.random() * 2_000);
     logger.info({ reason, delay }, 'pubsub reconnecting');
     setTimeout(() => this.connect().catch(() => {}), delay);
   }
