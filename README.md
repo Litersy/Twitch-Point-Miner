@@ -43,6 +43,26 @@ Default admin login is set via `ADMIN_USERNAME` / `ADMIN_PASSWORD` in `.env` (fi
 - Modern SaaS-style UI, responsive, RU/EN i18n
 - Rate limiting, zod validation, helmet
 
+## Download (Local Version)
+
+These are direct download links for the **local version** of **TPF Panel**:
+
+* **Installer (recommended)**
+  https://github.com/Litersy/Twitch-Point-Miner/releases/download/v0.1.0/TPM.Panel.Setup.0.1.0.Win64.exe
+
+* **Portable version (no installation required)**
+  https://github.com/Litersy/Twitch-Point-Miner/releases/download/v0.1.0/TPM-Panel-portable-0.1.0.exe
+
+## Notes
+
+* These builds are designed to run **locally on your PC/server**.
+* The installer version provides a smoother setup experience and automatic configuration.
+* The portable version can be launched instantly without installation.
+* On first launch, default admin credentials are set via `.env` (`ADMIN_USERNAME` / `ADMIN_PASSWORD`).
+
+Choose the version that fits your workflow and run the panel locally.
+
+
 ## Project layout
 
 ```
