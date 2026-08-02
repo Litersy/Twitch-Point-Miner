@@ -15,6 +15,7 @@ type WatchState = {
   info: StreamInfo;
   startedAt: number;
   lastSent: number;
+  lastFailureLogAt: number;
 };
 
 const MAX_WATCH = 2; // Twitch limit: you can only accrue watch progress on 2 channels simultaneously.
@@ -56,6 +57,7 @@ export class MinerSession {
   private pollTimer?: NodeJS.Timeout;
   private watchTimer?: NodeJS.Timeout;
   private activeWatch = new Map<string, WatchState>();
+  private watchInitFailureAt = new Map<string, number>();
   private stopping = false;
   private readonly userAgent = pickUserAgent();
 
@@ -226,11 +228,24 @@ export class MinerSession {
       // a 0 — writing that as the newest snapshot would collapse the displayed
       // balance to zero even though the account actually gained points.
       const balanceRaw = payload.data?.balance?.balance;
-      const balance: number | null = typeof balanceRaw === 'number' ? balanceRaw : null;
-      const channelId: string = gain.channel_id;
-      const amount: number = gain.total_points;
+      const balanceNumber =
+        typeof balanceRaw === 'number'
+          ? balanceRaw
+          : typeof balanceRaw === 'string' && balanceRaw.trim() !== ''
+            ? Number(balanceRaw)
+            : NaN;
+      const balance = Number.isFinite(balanceNumber) ? balanceNumber : null;
+      const channelId = String(gain.channel_id ?? '');
+      const amountRaw = gain.total_points;
+      const amount =
+        typeof amountRaw === 'number'
+          ? amountRaw
+          : typeof amountRaw === 'string' && amountRaw.trim() !== ''
+            ? Number(amountRaw)
+            : NaN;
       const reason: string = gain.reason_code;
-      const streamer = this.streamers.find((s) => s.twitchId === channelId);
+      if (!channelId || !Number.isFinite(amount)) return;
+      const streamer = this.streamers.find((s) => String(s.twitchId) === channelId);
       if (!streamer) return;
 
       await prisma.pointsEvent.create({
@@ -251,7 +266,7 @@ export class MinerSession {
       }
       await this.writeLog('info', 'points', `+${amount} on ${streamer.login} (${reason})`, { amount, reason });
     } else if (payload?.type === 'claim-available') {
-      const channelId: string = payload.data?.claim?.channel_id;
+      const channelId = String(payload.data?.claim?.channel_id ?? '');
       const claimId: string = payload.data?.claim?.id;
       const streamer = this.streamers.find((s) => s.twitchId === channelId);
       if (!streamer || !this.gql) return;
@@ -383,6 +398,16 @@ export class MinerSession {
         const info = await this.gql.getStreamInfo(s.login);
         if (!info.isLive || !info.broadcastId) continue;
         const spadeUrl = await fetchSpadeUrl(s.login, this.userAgent);
+        if (!spadeUrl) {
+          const now = Date.now();
+          const lastFailure = this.watchInitFailureAt.get(s.id) ?? 0;
+          if (now - lastFailure > 5 * 60_000) {
+            this.watchInitFailureAt.set(s.id, now);
+            await this.writeLog('warn', 'miner', `could not initialize playback tracking for ${s.login}`);
+          }
+          continue;
+        }
+        this.watchInitFailureAt.delete(s.id);
         const session = await prisma.watchSession.create({
           data: { accountId: this.accountId, streamerId: s.id, minutes: 0 },
         });
@@ -392,6 +417,7 @@ export class MinerSession {
           info,
           startedAt: Date.now(),
           lastSent: 0,
+          lastFailureLogAt: 0,
         });
         await this.writeLog('info', 'miner', `watching ${s.login}`, { viewers: s.viewersCount });
       } catch (err: any) {
@@ -411,8 +437,18 @@ export class MinerSession {
           state.spadeUrl = await fetchSpadeUrl(s.login, this.userAgent);
           if (!state.spadeUrl) continue;
         }
+        const currentInfo = await this.gql.getStreamInfo(s.login);
+        if (!currentInfo.isLive || !currentInfo.broadcastId) continue;
+        state.info = currentInfo;
         const playback = await this.gql.getPlaybackAccessToken(s.login);
-        if (playback) await simulatePlayerOpen(s.login, playback, this.userAgent);
+        if (!playback || !(await simulatePlayerOpen(s.login, playback, this.userAgent))) {
+          const now = Date.now();
+          if (now - state.lastFailureLogAt > 5 * 60_000) {
+            state.lastFailureLogAt = now;
+            await this.writeLog('warn', 'miner', `playback stream was not opened for ${s.login}; points event skipped`);
+          }
+          continue;
+        }
 
         if (!state.info.broadcastId || !s.twitchId) continue;
         const ok = await sendMinuteWatched(
@@ -433,6 +469,16 @@ export class MinerSession {
             data: { minutes: { increment: 1 } },
           });
           state.lastSent = Date.now();
+        } else {
+          // Refresh the tracking endpoint on the next tick after a rejected event;
+          // Twitch rotates it occasionally and a stale URL otherwise looks like
+          // an active watch session in the panel while no points accrue.
+          state.spadeUrl = null;
+          const now = Date.now();
+          if (now - state.lastFailureLogAt > 5 * 60_000) {
+            state.lastFailureLogAt = now;
+            await this.writeLog('warn', 'miner', `minute-watched request rejected for ${s.login}; tracking URL will be refreshed`);
+          }
         }
       } catch (err: any) {
         logger.debug({ err: err?.message, login: s.login }, 'minute-watched error');

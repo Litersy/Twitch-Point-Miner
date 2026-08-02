@@ -23,6 +23,21 @@ const MAX_ATTEMPTS = 4;
 
 type Method = 'GET' | 'HEAD' | 'POST';
 
+function lastPlaylistUrl(text: string, baseUrl?: string): string | null {
+  const lines = text.split(/\r?\n/).map((line) => line.trim());
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (!line || line.startsWith('#')) continue;
+    try {
+      const url = baseUrl ? new URL(line, baseUrl) : new URL(line);
+      if (url.protocol === 'http:' || url.protocol === 'https:') return url.href;
+    } catch {
+      // Ignore comments and malformed playlist entries.
+    }
+  }
+  return null;
+}
+
 async function httpWithRetry(
   url: string,
   init: { method: Method; headers: Record<string, string>; body?: string },
@@ -136,9 +151,8 @@ export async function simulatePlayerOpen(
       return false;
     }
     const text = await hls.bodyText();
-    const lines = text.split('\n').filter(Boolean);
-    const lastUrl = lines[lines.length - 1];
-    if (!lastUrl?.startsWith('http')) return false;
+    const lastUrl = lastPlaylistUrl(text);
+    if (!lastUrl) return false;
 
     // Fetch the lowest-quality sub-playlist, then HEAD the segment URL it contains.
     const sub = await httpWithRetry(lastUrl, {
@@ -150,9 +164,8 @@ export async function simulatePlayerOpen(
       return false;
     }
     const subText = await sub.bodyText();
-    const subLines = subText.split('\n').filter(Boolean);
-    const segment = subLines[subLines.length - 1];
-    if (!segment?.startsWith('http')) return false;
+    const segment = lastPlaylistUrl(subText, lastUrl);
+    if (!segment) return false;
 
     const head = await httpWithRetry(segment, {
       method: 'HEAD',
